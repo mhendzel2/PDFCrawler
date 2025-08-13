@@ -4,6 +4,8 @@ import * as path from 'path';
 import * as os from 'os';
 import { pubmedService } from './pubmed';
 import { browserAuthService, type BrowserSession } from './browser-auth';
+import * as cheerio from 'cheerio';
+import pLimit from 'p-limit';
 
 export interface DownloadSession {
   sessionId: string;
@@ -136,76 +138,57 @@ export class PDFDownloaderService {
     try {
       console.log(`Attempting browser session download for PMID ${pmid}`);
       
-      const downloadUrls: string[] = [];
-      
-      // Generate direct publisher URLs using authenticated EZProxy
+      // 1. Try resolving DOI to find PDF
       if (doi) {
-        downloadUrls.push(
-          `https://login.ezproxy.library.ualberta.ca/login?url=https://doi.org/${doi}`,
-          `https://login.ezproxy.library.ualberta.ca/login?url=https://link.springer.com/content/pdf/${doi}.pdf`,
-          `https://login.ezproxy.library.ualberta.ca/login?url=https://onlinelibrary.wiley.com/doi/pdf/${doi}`,
-          `https://login.ezproxy.library.ualberta.ca/login?url=https://www.nature.com/articles/${doi}.pdf`,
-          `https://login.ezproxy.library.ualberta.ca/login?url=https://pubs.acs.org/doi/pdf/${doi}`
-        );
-      }
-      
-      if (pmcid) {
-        downloadUrls.push(
-          `https://login.ezproxy.library.ualberta.ca/login?url=https://www.ncbi.nlm.nih.gov/pmc/articles/${pmcid}/pdf/`
-        );
-      }
+        const articleUrl = `https://doi.org/${doi}`;
+        const pdfUrl = await this.findPdfUrl(articleUrl, browserSession);
 
-      // Try each URL with the authenticated session
-      for (const url of downloadUrls) {
-        try {
-          const response = await fetch(url, {
-            method: 'GET',
+        if (pdfUrl) {
+          const response = await fetch(pdfUrl, {
             headers: {
               'User-Agent': browserSession.userAgent,
               'Cookie': browserSession.cookies.join('; '),
-              'Accept': 'application/pdf,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-              'Accept-Language': 'en-US,en;q=0.5',
-              'Connection': 'keep-alive'
             },
-            redirect: 'follow'
+            redirect: 'follow',
           });
 
-          if (response.ok) {
-            const contentType = response.headers.get('content-type');
-            if (contentType && contentType.includes('application/pdf')) {
-              const buffer = await response.buffer();
-              const fileName = this.generateFileName(pmid, doi);
-              const filePath = path.join(this.downloadFolder, fileName);
-              
-              fs.writeFileSync(filePath, buffer);
-              
-              console.log(`Successfully downloaded PDF for PMID ${pmid} using browser session`);
-              return {
-                pmid,
-                success: true,
-                filePath,
-                fileSize: buffer.length
-              };
-            }
+          if (response.ok && response.headers.get('content-type')?.includes('application/pdf')) {
+            const buffer = await response.buffer();
+            const fileName = this.generateFileName(pmid, doi);
+            const filePath = path.join(this.downloadFolder, fileName);
+            fs.writeFileSync(filePath, buffer);
+            console.log(`Successfully downloaded PDF for PMID ${pmid} via DOI resolution (browser session)`);
+            return { pmid, success: true, filePath, fileSize: buffer.length };
           }
-        } catch (error: any) {
-          console.log(`Failed to download from ${url}: ${error.message}`);
-          continue;
         }
       }
 
-      return {
-        pmid,
-        success: false,
-        error: 'No PDF found through browser session'
-      };
+      // 2. Try PMCID direct link as a fallback
+      if (pmcid) {
+        const pmcUrl = `https://www.ncbi.nlm.nih.gov/pmc/articles/${pmcid}/pdf/`;
+        const ezproxyPmcUrl = this._getEzproxyUrl(pmcUrl);
+        const response = await fetch(ezproxyPmcUrl, {
+          headers: {
+            'User-Agent': browserSession.userAgent,
+            'Cookie': browserSession.cookies.join('; '),
+          },
+          redirect: 'follow',
+        });
+
+        if (response.ok && response.headers.get('content-type')?.includes('application/pdf')) {
+          const buffer = await response.buffer();
+          const fileName = this.generateFileName(pmid, doi);
+          const filePath = path.join(this.downloadFolder, fileName);
+          fs.writeFileSync(filePath, buffer);
+          console.log(`Successfully downloaded PDF for PMID ${pmid} via PMCID (browser session)`);
+          return { pmid, success: true, filePath, fileSize: buffer.length };
+        }
+      }
+
+      return { pmid, success: false, error: 'No PDF found through browser session' };
     } catch (error: any) {
       console.error(`Browser download error for PMID ${pmid}:`, error.message);
-      return {
-        pmid,
-        success: false,
-        error: error.message
-      };
+      return { pmid, success: false, error: error.message };
     }
   }
 
@@ -289,42 +272,16 @@ export class PDFDownloaderService {
   }
 
   public async attemptEZProxyDownload(
-    session: DownloadSession, 
-    doi?: string, 
-    pmcid?: string, 
+    session: DownloadSession,
+    doi?: string,
+    pmcid?: string,
     pmid?: string
   ): Promise<Buffer | null> {
     console.log(`Attempting EZProxy download for PMID ${pmid}, DOI: ${doi}, PMCID: ${pmcid}`);
-    
-    // Re-authenticate if needed by setting up a fresh session
-    if (session.username && session.password) {
-      try {
-        const loginUrl = 'https://login.ezproxy.library.ualberta.ca/login';
-        
-        // Get fresh authentication cookies
-        const authResponse = await fetch(loginUrl, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Connection': 'keep-alive',
-            'Origin': 'https://login.ezproxy.library.ualberta.ca'
-          },
-          body: new URLSearchParams({
-            user: session.username,
-            pass: session.password,
-            url: ''
-          }),
-          redirect: 'manual',
-        });
 
-        // Update session cookies
-        const authCookies = authResponse.headers.raw()['set-cookie'] || [];
-        session.cookies = authCookies;
-      } catch (authError) {
-        console.error('Re-authentication failed:', authError);
-      }
+    // Re-authenticate if needed
+    if (session.username && session.password) {
+      await this.authenticateSession(session.sessionId, session.username, session.password);
     }
 
     const headers = {
@@ -336,52 +293,32 @@ export class PDFDownloaderService {
       'Upgrade-Insecure-Requests': '1'
     };
 
-    // Try DOI-based URLs through EZProxy
+    // 1. Try resolving DOI to find PDF
     if (doi) {
-      const doiUrls = [
-        `https://doi.org/${doi}`,
-        `https://link.springer.com/content/pdf/${doi}.pdf`,
-        `https://onlinelibrary.wiley.com/doi/pdf/${doi}`,
-        `https://www.nature.com/articles/${doi}.pdf`,
-        `https://pubs.acs.org/doi/pdf/${doi}`,
-        `https://journals.asm.org/doi/pdf/${doi}`
-      ];
+      try {
+        const articleUrl = `https://doi.org/${doi}`;
+        const pdfUrl = await this.findPdfUrl(articleUrl, session);
 
-      for (const directUrl of doiUrls) {
-        try {
-          // Create EZProxy URL
-          const ezproxyUrl = `https://login.ezproxy.library.ualberta.ca/login?url=${encodeURIComponent(directUrl)}`;
-          
-          const response = await fetch(ezproxyUrl, {
-            headers,
-            redirect: 'follow',
-          });
-          
-          const contentType = response.headers.get('content-type') || '';
-          if (response.ok && contentType.includes('application/pdf')) {
-            console.log(`PDF found via EZProxy DOI: ${directUrl}`);
+        if (pdfUrl) {
+          const response = await fetch(pdfUrl, { headers, redirect: 'follow' });
+          if (response.ok && response.headers.get('content-type')?.includes('application/pdf')) {
+            console.log(`PDF found via DOI resolution: ${pdfUrl}`);
             return Buffer.from(await response.arrayBuffer());
           }
-        } catch (error) {
-          console.error(`EZProxy DOI attempt failed for ${directUrl}:`, error);
-          continue;
         }
+      } catch (error) {
+        console.error(`DOI resolution download failed for ${doi}:`, error);
       }
     }
 
-    // Try PMC through EZProxy
+    // 2. Try PMCID direct link as a fallback
     if (pmcid) {
       try {
         const pmcUrl = `https://www.ncbi.nlm.nih.gov/pmc/articles/${pmcid}/pdf/`;
-        const ezproxyPmcUrl = `https://login.ezproxy.library.ualberta.ca/login?url=${encodeURIComponent(pmcUrl)}`;
+        const ezproxyPmcUrl = this._getEzproxyUrl(pmcUrl);
+        const response = await fetch(ezproxyPmcUrl, { headers, redirect: 'follow' });
         
-        const response = await fetch(ezproxyPmcUrl, {
-          headers,
-          redirect: 'follow',
-        });
-        
-        const contentType = response.headers.get('content-type') || '';
-        if (response.ok && contentType.includes('application/pdf')) {
+        if (response.ok && response.headers.get('content-type')?.includes('application/pdf')) {
           console.log(`PDF found via EZProxy PMC: ${pmcid}`);
           return Buffer.from(await response.arrayBuffer());
         }
@@ -394,124 +331,68 @@ export class PDFDownloaderService {
     return null;
   }
 
-  private async attemptPDFDownload(
-    session: DownloadSession, 
-    doi?: string, 
-    pmcid?: string, 
-    pmid?: string
-  ): Promise<Buffer | null> {
-    const headers = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      'Accept': 'application/pdf,text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.5',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'Connection': 'keep-alive',
-      'Cookie': session.cookies.join('; '),
-      'Upgrade-Insecure-Requests': '1'
-    };
+  private _getEzproxyUrl(url: string): string {
+    return `${this.proxyBase}?url=${encodeURIComponent(url)}`;
+  }
 
-    // University of Alberta EZProxy prefix format
-    const ezproxyPrefix = 'https://login.ezproxy.library.ualberta.ca/login?url=';
+  private async findPdfUrl(
+    articleUrl: string,
+    session: DownloadSession | BrowserSession
+  ): Promise<string | null> {
+    try {
+      const proxiedUrl = this._getEzproxyUrl(articleUrl);
+      console.log(`Searching for PDF on page: ${proxiedUrl}`);
+      const response = await fetch(proxiedUrl, {
+        headers: {
+          ...('cookies' in session && { Cookie: session.cookies.join('; ') }),
+          ...('userAgent' in session && { 'User-Agent': session.userAgent }),
+        },
+        redirect: 'follow',
+      });
 
-    // Try DOI through EZProxy first
-    if (doi) {
-      try {
-        // Common DOI PDF URLs to try through EZProxy
-        const doiUrls = [
-          `https://doi.org/${doi}`,
-          `https://link.springer.com/content/pdf/${doi}.pdf`,
-          `https://onlinelibrary.wiley.com/doi/pdf/${doi}`,
-          `https://www.nature.com/articles/${doi}.pdf`,
-          `https://pubs.acs.org/doi/pdf/${doi}`
-        ];
+      if (!response.ok) {
+        console.error(`Failed to fetch article page: ${response.statusText}`);
+        return null;
+      }
 
-        for (const doiUrl of doiUrls) {
-          try {
-            const ezproxyUrl = ezproxyPrefix + encodeURIComponent(doiUrl);
-            const response = await fetch(ezproxyUrl, {
-              headers,
-              redirect: 'follow',
-            });
-            
-            const contentType = response.headers.get('content-type') || '';
-            if (response.ok && contentType.includes('application/pdf')) {
-              console.log(`PDF downloaded successfully via EZProxy DOI: ${doiUrl}`);
-              return Buffer.from(await response.arrayBuffer());
-            }
-          } catch (error) {
-            console.error(`EZProxy DOI attempt failed for ${doiUrl}:`, error);
-            continue;
+      const html = await response.text();
+      const $ = cheerio.load(html);
+      let pdfLink: string | null = null;
+
+      // Look for <a> tags with href ending in .pdf
+      $('a[href$=".pdf"]').each((i, el) => {
+        const href = $(el).attr('href');
+        if (href) {
+          // Prioritize links with "pdf" in the text or title
+          const linkText = $(el).text().toLowerCase();
+          const linkTitle = $(el).attr('title')?.toLowerCase() || '';
+          if (linkText.includes('pdf') || linkTitle.includes('pdf')) {
+            pdfLink = href;
+            return false; // Stop searching
+          }
+          // Otherwise, take the first one we find
+          if (!pdfLink) {
+            pdfLink = href;
           }
         }
-      } catch (error) {
-        console.error(`DOI download failed for ${doi}:`, error);
-      }
-    }
+      });
 
-    // Try PMC through EZProxy
-    if (pmcid) {
-      try {
-        const pmcUrl = `https://www.ncbi.nlm.nih.gov/pmc/articles/${pmcid}/pdf/`;
-        const ezproxyPmcUrl = ezproxyPrefix + encodeURIComponent(pmcUrl);
-        
-        const response = await fetch(ezproxyPmcUrl, {
-          headers,
-          redirect: 'follow',
-        });
-        
-        const contentType = response.headers.get('content-type') || '';
-        if (response.ok && contentType.includes('application/pdf')) {
-          console.log(`PDF downloaded successfully via EZProxy PMC: ${pmcid}`);
-          return Buffer.from(await response.arrayBuffer());
-        }
-      } catch (error) {
-        console.error(`EZProxy PMC download failed for ${pmcid}:`, error);
+      if (pdfLink) {
+        // Handle relative URLs
+        const absoluteUrl = new URL(pdfLink, response.url).toString();
+        console.log(`Found potential PDF link: ${absoluteUrl}`);
+        return absoluteUrl;
       }
-    }
 
-    // Try PubMed Central direct access through EZProxy
-    if (pmid) {
-      try {
-        const pubmedUrl = `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`;
-        const ezproxyPubmedUrl = ezproxyPrefix + encodeURIComponent(pubmedUrl);
-        
-        const response = await fetch(ezproxyPubmedUrl, {
-          headers,
-          redirect: 'follow',
-        });
-        
-        // Look for PDF links in the response
-        if (response.ok) {
-          const html = await response.text();
-          const pdfLinkMatch = html.match(/href="([^"]*\.pdf[^"]*)"/i);
-          
-          if (pdfLinkMatch) {
-            const pdfUrl = pdfLinkMatch[1];
-            const fullPdfUrl = pdfUrl.startsWith('http') ? pdfUrl : `https://pubmed.ncbi.nlm.nih.gov${pdfUrl}`;
-            const ezproxyPdfUrl = ezproxyPrefix + encodeURIComponent(fullPdfUrl);
-            
-            const pdfResponse = await fetch(ezproxyPdfUrl, {
-              headers,
-              redirect: 'follow',
-            });
-            
-            const pdfContentType = pdfResponse.headers.get('content-type') || '';
-            if (pdfResponse.ok && pdfContentType.includes('application/pdf')) {
-              console.log(`PDF downloaded successfully via EZProxy PubMed: ${pmid}`);
-              return Buffer.from(await pdfResponse.arrayBuffer());
-            }
-          }
-        }
-      } catch (error) {
-        console.error(`EZProxy PubMed download failed for ${pmid}:`, error);
-      }
+      console.log('No direct PDF link found on page.');
+      return null;
+    } catch (error) {
+      console.error(`Error finding PDF URL for ${articleUrl}:`, error);
+      return null;
     }
-
-    return null;
   }
 
   public generateEZProxyURLs(doi?: string, pmcid?: string, pmid?: string): string[] {
-    const ezproxyPrefix = 'https://login.ezproxy.library.ualberta.ca/login?url=';
     const urls: string[] = [];
 
     if (doi) {
@@ -524,10 +405,7 @@ export class PDFDownloaderService {
         `https://journals.asm.org/doi/pdf/${doi}`,
         `https://academic.oup.com/search-results?page=1&q=${doi}`
       ];
-      
-      doiUrls.forEach(url => {
-        urls.push(ezproxyPrefix + encodeURIComponent(url));
-      });
+      doiUrls.forEach(url => urls.push(this._getEzproxyUrl(url)));
     }
 
     if (pmcid) {
@@ -535,20 +413,14 @@ export class PDFDownloaderService {
         `https://www.ncbi.nlm.nih.gov/pmc/articles/${pmcid}/pdf/`,
         `https://www.ncbi.nlm.nih.gov/pmc/articles/${pmcid}/`
       ];
-      
-      pmcUrls.forEach(url => {
-        urls.push(ezproxyPrefix + encodeURIComponent(url));
-      });
+      pmcUrls.forEach(url => urls.push(this._getEzproxyUrl(url)));
     }
 
     if (pmid) {
       const pubmedUrls = [
         `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`
       ];
-      
-      pubmedUrls.forEach(url => {
-        urls.push(ezproxyPrefix + encodeURIComponent(url));
-      });
+      pubmedUrls.forEach(url => urls.push(this._getEzproxyUrl(url)));
     }
 
     return urls;
@@ -605,26 +477,25 @@ Free alternatives may be available through PubMed Central or institutional repos
   }
 
   async downloadBatch(sessionId: string, pmids: string[], onProgress?: (progress: any) => void): Promise<DownloadResult[]> {
-    const results: DownloadResult[] = [];
-    
-    for (let i = 0; i < pmids.length; i++) {
-      const pmid = pmids[i];
-      
-      if (onProgress) {
-        onProgress({
-          current: i + 1,
-          total: pmids.length,
-          currentPmid: pmid,
-        });
-      }
-      
-      const result = await this.downloadPDF(sessionId, pmid);
-      results.push(result);
-      
-      // Be respectful to servers
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-    
+    const limit = pLimit(5); // Set concurrency limit to 5
+    let completed = 0;
+
+    const promises = pmids.map(pmid => {
+      return limit(async () => {
+        const result = await this.downloadPDF(sessionId, pmid);
+        completed++;
+        if (onProgress) {
+          onProgress({
+            current: completed,
+            total: pmids.length,
+            currentPmid: pmid,
+          });
+        }
+        return result;
+      });
+    });
+
+    const results = await Promise.all(promises);
     return results;
   }
 }
